@@ -333,7 +333,7 @@ fi
 # Download SCP scripts & install deps
 # ==========================================
 print_status "Setting up SCP scripts..."
-curl -fsSL "$URL_BASE/scripts.tar.gz" | tar xz -C "$APP_DIR" --strip-components=0
+curl -fsSL "$URL_BASE/scripts.tar.gz" | tar xz --no-same-owner -C "$APP_DIR" --strip-components=0
 
 cd "$APP_DIR/scripts"
 npm install --production --silent 2>/dev/null
