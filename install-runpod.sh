@@ -34,7 +34,7 @@ UNINSTALL=false
 
 APP_NAME="server-transcode"
 APP_DIR="/workspace/server-transcode"
-URL_BASE="https://raw.githubusercontent.com/vdohide-core/server-transcode-releases/main"
+URL_BASE="https://github.com/vdohide-core/server-transcode/releases/latest/download"
 PID_DIR="$APP_DIR/pids"
 LOG_DIR="$APP_DIR/log"
 
