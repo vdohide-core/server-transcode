@@ -308,9 +308,9 @@ cd "$APP_DIR"
 # ==========================================
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
-    BINARY="server-transcode-linux"
+    BINARY="linux"
 elif [ "$ARCH" = "aarch64" ]; then
-    BINARY="server-transcode-linux-arm64"
+    BINARY="linux-arm64"
 else
     print_error "Unsupported architecture: $ARCH"
     exit 1
@@ -333,10 +333,7 @@ fi
 # Download SCP scripts & install deps
 # ==========================================
 print_status "Setting up SCP scripts..."
-curl -fsSL "$URL_BASE/scripts/package.json" -o "$APP_DIR/scripts/package.json"
-curl -fsSL "$URL_BASE/scripts/scp-upload.js" -o "$APP_DIR/scripts/scp-upload.js"
-curl -fsSL "$URL_BASE/scripts/scp-upload-dir.js" -o "$APP_DIR/scripts/scp-upload-dir.js"
-curl -fsSL "$URL_BASE/scripts/scp-download.js" -o "$APP_DIR/scripts/scp-download.js"
+curl -fsSL "$URL_BASE/scripts.tar.gz" | tar xz -C "$APP_DIR" --strip-components=0
 
 cd "$APP_DIR/scripts"
 npm install --production --silent 2>/dev/null
