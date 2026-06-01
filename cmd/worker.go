@@ -521,14 +521,20 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		uploadStepName := fmt.Sprintf("upload_%s", res)
 		startStep(ctx, process.ID, uploadStepName)
 		log.Printf("📤 [%s] Uploading %s...", slug, fileName)
-		if err := uploadFile(ctx, process, uploadStorage, outputPath, fileName); err != nil {
+		onUploadProgress := func(p uploader.SCPProgress) {
+			if p.Type == "progress" && p.Total > 0 {
+				percent := float64(p.Transferred) / float64(p.Total) * 100
+				updateTimelineStep(ctx, process.ID, uploadStepName, models.StepStatusProcessing, percent)
+			}
+		}
+		if err := uploadFile(ctx, process, uploadStorage, outputPath, fileName, onUploadProgress); err != nil {
 			// If permission/auth error, try alternative storage before failing
 			if isPermissionError(err) && uploadStorage.ID != "" {
 				log.Printf("⚠️  [%s] Permission denied on %s — trying alternative storage...", slug, uploadStorage.Name)
 				altStorage, altErr := findAlternativeStorage(ctx, uploadStorage.ID)
 				if altErr == nil {
 					log.Printf("📦 [%s] Retrying upload on %s", slug, altStorage.Name)
-					if retryErr := uploadFile(ctx, process, altStorage, outputPath, fileName); retryErr == nil {
+					if retryErr := uploadFile(ctx, process, altStorage, outputPath, fileName, onUploadProgress); retryErr == nil {
 						uploadStorage = altStorage // use alt storage for remaining uploads
 						goto uploadSuccess
 					} else {
@@ -693,7 +699,7 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 
 // ─── Upload Helpers ──────────────────────────────────────────
 
-func uploadFile(_ context.Context, process *models.VideoProcess, storage *models.Storage, localPath, fileName string) error {
+func uploadFile(_ context.Context, process *models.VideoProcess, storage *models.Storage, localPath, fileName string, onProgress uploader.OnSCPProgress) error {
 	fileID := derefStr(process.FileID)
 	localStoragePath := config.AppConfig.StoragePath
 	localStorageID := config.AppConfig.StorageId
@@ -720,7 +726,7 @@ func uploadFile(_ context.Context, process *models.VideoProcess, storage *models
 			scpConfig.Port = 22
 		}
 
-		return uploader.UploadViaSCP(scpConfig, nil)
+		return uploader.UploadViaSCP(scpConfig, onProgress)
 	}
 
 	return fmt.Errorf("no upload method available for storage %s", storage.ID)
