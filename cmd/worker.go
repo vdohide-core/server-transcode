@@ -387,8 +387,8 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 
 	orientation := transcoder.DetectOrientation(videoInfo.Width, videoInfo.Height)
 	shortSide := transcoder.ShortSide(videoInfo.Width, videoInfo.Height)
-	log.Printf("📐 [%s] Video: %dx%d, duration: %ds, codec: %s, orientation: %s, shortSide: %d",
-		slug, videoInfo.Width, videoInfo.Height, videoInfo.Duration, videoInfo.Codec, orientation, shortSide)
+	log.Printf("📐 [%s] Video: %dx%d, duration: %ds, codec: %s, orientation: %s, shortSide: %d, bitrate: %dkbps",
+		slug, videoInfo.Width, videoInfo.Height, videoInfo.Duration, videoInfo.Codec, orientation, shortSide, videoInfo.VideoBitrate)
 
 	// ─── STEP 3: DETERMINE resolutions ───────────────────────────
 	targetResolutions := transcoder.DetermineResolutions(shortSide)
@@ -503,7 +503,7 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 
 			log.Printf("🎬 [%s] Encoding %sp (%dx%d)...", slug, res, targetW, targetH)
 
-			err := transcoder.EncodeResolution(originalPath, outputPath, targetW, targetH, videoInfo.DurationF, func(percent int) {
+			err := transcoder.EncodeResolution(originalPath, outputPath, targetW, targetH, videoInfo.DurationF, videoInfo.VideoBitrate, int(shortSide), func(percent int) {
 				updateTimelineStep(ctx, process.ID, stepName, models.StepStatusProcessing, float64(percent))
 				overallPercent := encodeProgressBase + float64(idx)*perResProgress + float64(percent)/100.0*perResProgress
 				updateOverallPercent(ctx, process.ID, overallPercent)

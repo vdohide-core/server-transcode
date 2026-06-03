@@ -140,6 +140,68 @@ func testEncoder(encoder string) bool {
 	return true
 }
 
+// getBitrateForRes returns target bitrate, maxrate, bufsize for a resolution
+// Dynamically caps based on original file's bitrate to prevent output inflation
+func getBitrateForRes(shortSide int, srcBitrateKbps int64, srcShortSide int) (bitrate string, maxrate string, bufsize string) {
+	// Default bitrates — balanced for streaming (Netflix H.264 level)
+	var defBR, defMax, defBuf int
+	switch {
+	case shortSide >= 1080:
+		defBR, defMax, defBuf = 3500, 5250, 7000
+	case shortSide >= 720:
+		defBR, defMax, defBuf = 2000, 3000, 4000
+	case shortSide >= 480:
+		defBR, defMax, defBuf = 1000, 1500, 2000
+	default: // 360p
+		defBR, defMax, defBuf = 600, 900, 1200
+	}
+
+	// Cap proportionally if original bitrate is known
+	if srcBitrateKbps > 0 && srcShortSide > 0 {
+		// Proportional bitrate based on pixel count ratio (shortSide²)
+		// Apply 85% safety margin — since we re-encode audio (96-128k) and add container overhead,
+		// using 100% of source video bitrate would make total output exceed original file size
+		ratio := float64(shortSide) * float64(shortSide) / (float64(srcShortSide) * float64(srcShortSide))
+		capBR := int(float64(srcBitrateKbps) * ratio * 0.85)
+
+		// Minimum floor per resolution to avoid terrible quality
+		minBR := 200
+		switch {
+		case shortSide >= 1080:
+			minBR = 1000
+		case shortSide >= 720:
+			minBR = 600
+		case shortSide >= 480:
+			minBR = 350
+		}
+		if capBR < minBR {
+			capBR = minBR
+		}
+
+		if capBR < defBR {
+			log.Printf("📊 Bitrate cap %dp: %dk → %dk (src: %dkbps @ %dp, ratio: %.2f)",
+				shortSide, defBR, capBR, srcBitrateKbps, srcShortSide, ratio)
+			defBR = capBR
+			defMax = capBR * 11 / 10 // 1.1x — strict cap for GPU encoders
+			defBuf = capBR * 2       // 2x
+		}
+	}
+
+	return fmt.Sprintf("%dk", defBR), fmt.Sprintf("%dk", defMax), fmt.Sprintf("%dk", defBuf)
+}
+
+// getAudioBitrate returns audio bitrate per resolution
+func getAudioBitrate(shortSide int) string {
+	switch {
+	case shortSide >= 1080:
+		return "128k"
+	case shortSide >= 360:
+		return "96k"
+	default:
+		return "64k"
+	}
+}
+
 // getCRF returns CRF/CQ value based on resolution
 // Standard streaming quality — lower = better quality, larger file
 func getCRF(shortSide int) int {
@@ -155,46 +217,21 @@ func getCRF(shortSide int) int {
 	return 27
 }
 
-// getBitrateForRes returns target bitrate, maxrate, bufsize for a resolution
-// Balanced for streaming — close to Netflix H.264 quality
-func getBitrateForRes(shortSide int) (bitrate string, maxrate string, bufsize string) {
-	switch {
-	case shortSide >= 1080:
-		return "3500k", "5250k", "7000k"
-	case shortSide >= 720:
-		return "2000k", "3000k", "4000k"
-	case shortSide >= 480:
-		return "1000k", "1500k", "2000k"
-	default: // 360p
-		return "600k", "900k", "1200k"
-	}
-}
-
-// getAudioBitrate returns audio bitrate per resolution
-func getAudioBitrate(shortSide int) string {
-	switch {
-	case shortSide >= 1080:
-		return "128k"
-	case shortSide >= 360:
-		return "96k"
-	default:
-		return "64k"
-	}
-}
-
 // getEncoderArgs returns ffmpeg encoder arguments based on detected encoder
-func getEncoderArgs(encoder string, shortSide int) []string {
+// Constrained CRF/CQ mode — quality-first with strict bitrate cap to prevent inflation
+// srcBitrateKbps/srcShortSide enable dynamic bitrate capping
+func getEncoderArgs(encoder string, shortSide int, srcBitrateKbps int64, srcShortSide int) []string {
 	crf := getCRF(shortSide)
-	bitrate, maxrate, bufsize := getBitrateForRes(shortSide)
+	bitrate, maxrate, bufsize := getBitrateForRes(shortSide, srcBitrateKbps, srcShortSide)
 
 	switch encoder {
 	case EncoderNVENC:
+		// Pure bitrate VBR — NVENC ignores maxrate when CQ is set, so no CQ here
 		return []string{
 			"-c:v", "h264_nvenc",
 			"-preset", "p5",
 			"-tune", "hq",
 			"-rc", "vbr",
-			"-cq", strconv.Itoa(crf),
 			"-b:v", bitrate,
 			"-maxrate", maxrate,
 			"-bufsize", bufsize,
@@ -203,30 +240,35 @@ func getEncoderArgs(encoder string, shortSide int) []string {
 			"-b_ref_mode", "middle",
 		}
 	case EncoderAMF:
-		qp := crf + 2
+		// VBR with bitrate cap (AMF CQP doesn't support maxrate)
 		return []string{
 			"-c:v", "h264_amf",
 			"-quality", "quality",
-			"-rc", "cqp",
-			"-qp_i", strconv.Itoa(qp),
-			"-qp_p", strconv.Itoa(qp + 2),
-			"-profile:v", "high",
-		}
-	case EncoderQSV:
-		return []string{
-			"-c:v", "h264_qsv",
-			"-preset", "slow",
-			"-global_quality", strconv.Itoa(crf),
-			"-look_ahead", "1",
+			"-rc", "vbr_peak",
+			"-b:v", bitrate,
 			"-maxrate", maxrate,
 			"-bufsize", bufsize,
 			"-profile:v", "high",
 		}
-	default: // CPU
+	case EncoderQSV:
+		// Constrained quality — global_quality for quality, maxrate as cap
+		return []string{
+			"-c:v", "h264_qsv",
+			"-preset", "slow",
+			"-global_quality", strconv.Itoa(crf),
+			"-b:v", bitrate,
+			"-maxrate", maxrate,
+			"-bufsize", bufsize,
+			"-look_ahead", "1",
+			"-profile:v", "high",
+		}
+	default: // CPU — constrained CRF (CRF for quality, maxrate as ceiling)
 		return []string{
 			"-c:v", "libx264",
 			"-preset", "medium",
 			"-crf", strconv.Itoa(crf),
+			"-maxrate", maxrate,
+			"-bufsize", bufsize,
 			"-profile:v", "high",
 			"-threads", "0",
 			"-x264-params", "keyint=60:min-keyint=30:scenecut=40",
@@ -236,7 +278,8 @@ func getEncoderArgs(encoder string, shortSide int) []string {
 
 // EncodeResolution encodes a video file to a specific resolution
 // Auto-detects GPU encoder, fallback to CPU
-func EncodeResolution(inputPath, outputPath string, targetW, targetH int, totalDuration float64, onProgress func(percent int)) error {
+// srcBitrateKbps/srcShortSide: original file's video bitrate and short side for dynamic capping
+func EncodeResolution(inputPath, outputPath string, targetW, targetH int, totalDuration float64, srcBitrateKbps int64, srcShortSide int, onProgress func(percent int)) error {
 	encoder := DetectEncoder()
 	scaleFilter := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2", targetW, targetH)
 
@@ -266,8 +309,8 @@ func EncodeResolution(inputPath, outputPath string, targetW, targetH int, totalD
 
 	args = append(args, "-i", inputPath)
 
-	// Add encoder-specific args (includes bitrate/maxrate for GPU)
-	args = append(args, getEncoderArgs(encoder, shortSide)...)
+	// Add encoder-specific args (includes dynamic bitrate capping)
+	args = append(args, getEncoderArgs(encoder, shortSide, srcBitrateKbps, srcShortSide)...)
 
 	// Always use CPU-based scale filter (compatible with all encoders)
 	args = append(args, "-vf", scaleFilter)
@@ -282,7 +325,8 @@ func EncodeResolution(inputPath, outputPath string, targetW, targetH int, totalD
 		outputPath,
 	)
 
-	log.Printf("🔧 Encoder: %s | CRF/CQ: %d | Audio: %s", encoder, getCRF(shortSide), audioBitrate)
+	bitrate, _, _ := getBitrateForRes(shortSide, srcBitrateKbps, srcShortSide)
+	log.Printf("🔧 Encoder: %s | CRF/CQ: %d | Bitrate: %s | Audio: %s | SrcBR: %dkbps", encoder, getCRF(shortSide), bitrate, audioBitrate, srcBitrateKbps)
 
 	cmd := exec.Command("ffmpeg", args...)
 
@@ -294,7 +338,7 @@ func EncodeResolution(inputPath, outputPath string, targetW, targetH int, totalD
 			detectedEncoder = EncoderCPU // force CPU for subsequent encodes
 
 			cpuArgs := []string{"-y", "-i", inputPath}
-			cpuArgs = append(cpuArgs, getEncoderArgs(EncoderCPU, shortSide)...)
+			cpuArgs = append(cpuArgs, getEncoderArgs(EncoderCPU, shortSide, srcBitrateKbps, srcShortSide)...)
 			cpuArgs = append(cpuArgs,
 				"-vf", scaleFilter,
 				"-c:a", "aac",

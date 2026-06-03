@@ -2,6 +2,7 @@ package transcoder
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -9,11 +10,12 @@ import (
 
 // VideoInfo contains video metadata from ffprobe
 type VideoInfo struct {
-	Width    int64
-	Height   int64
-	Duration int64   // in seconds
-	DurationF float64 // duration in seconds (float)
-	Codec    string
+	Width        int64
+	Height       int64
+	Duration     int64   // in seconds
+	DurationF    float64 // duration in seconds (float)
+	Codec        string
+	VideoBitrate int64 // video bitrate in kbps
 }
 
 // ProbeVideoInfo extracts width, height, duration, and codec from a video file
@@ -64,6 +66,34 @@ func ProbeVideoInfo(filePath string) (*VideoInfo, error) {
 	output, err = cmd.Output()
 	if err == nil {
 		info.Codec = strings.TrimSpace(string(output))
+	}
+
+	// Get video bitrate
+	cmd = exec.Command("ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=bit_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath,
+	)
+	output, err = cmd.Output()
+	if err == nil {
+		brStr := strings.TrimSpace(string(output))
+		if brStr != "" && brStr != "N/A" {
+			br, _ := strconv.ParseInt(brStr, 10, 64)
+			if br > 0 {
+				info.VideoBitrate = br / 1000 // bps → kbps
+			}
+		}
+	}
+
+	// Fallback: estimate video bitrate from file size
+	if info.VideoBitrate <= 0 && info.DurationF > 0 {
+		fileInfo, statErr := os.Stat(filePath)
+		if statErr == nil && fileInfo.Size() > 0 {
+			totalBitrateKbps := float64(fileInfo.Size()) * 8 / info.DurationF / 1000
+			info.VideoBitrate = int64(totalBitrateKbps * 0.85) // ~15% audio/overhead
+		}
 	}
 
 	if info.Width == 0 || info.Height == 0 {
