@@ -262,18 +262,24 @@ if command -v nvidia-smi &>/dev/null; then
 
         # Test NVENC actually works (not just compiled in)
         print_status "Testing NVENC encoding..."
-        if ffmpeg -v error -f lavfi -i "color=c=black:s=256x256:d=1:r=25" -pix_fmt yuv420p -c:v h264_nvenc -frames:v 1 -f null - 2>/dev/null; then
+        export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-all}"
+        NVENC_ERR=$(mktemp)
+        if ffmpeg -v error -f lavfi -i "color=c=black:s=256x256:d=1:r=25" -pix_fmt yuv420p -c:v h264_nvenc -frames:v 1 -f null - 2>"$NVENC_ERR"; then
             print_status "NVENC encoding works ✓"
             NVENC_OK=true
         else
             print_warning "NVENC test FAILED — GPU encoding will fall back to CPU."
+            if [ -s "$NVENC_ERR" ]; then
+                print_warning "  ffmpeg: $(head -3 "$NVENC_ERR" | tr '\n' ' ')"
+            fi
             print_warning ""
             print_warning "This is usually because NVIDIA_DRIVER_CAPABILITIES is not set."
             print_warning "To fix: In RunPod Dashboard → Edit Pod → Environment Variables:"
             print_warning "  NVIDIA_DRIVER_CAPABILITIES=all"
-            print_warning "Then restart the pod."
+            print_warning "Then restart the pod and re-run install or start.sh."
             print_warning ""
         fi
+        rm -f "$NVENC_ERR"
     else
         print_warning "nvidia-smi found but no GPU detected. Will use CPU fallback."
     fi

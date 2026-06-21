@@ -86,14 +86,20 @@ func findAndClaimFile(ctx context.Context) (*models.VideoProcess, *models.File, 
 			continue
 		}
 
-		// Check if already has transcoded resolutions (any of 360/480/720/1080)
-		transcodedCount, _ := models.MediaModel.CountDocuments(ctx, bson.M{
-			"fileId":     file.ID,
-			"type":       models.MediaTypeVideo,
-			"resolution": bson.M{"$in": []string{models.Resolution360, models.Resolution480, models.Resolution720, models.Resolution1080}},
+		// Skip when all resolutions have media or pending S3 ingest
+		if !needsTranscode(ctx, file.ID) {
+			skipReasons["nothing_to_transcode"]++
+			continue
+		}
+
+		// Block while download is still processing (need original media on disk/storage)
+		downloadActive, _ := models.VideoProcessModel.CountDocuments(ctx, bson.M{
+			"fileId":      file.ID,
+			"processType": models.ProcessTypeDownload,
+			"status":      models.ProcessStatusProcessing,
 		})
-		if transcodedCount > 0 {
-			skipReasons["already_transcoded"]++
+		if downloadActive > 0 {
+			skipReasons["download_processing"]++
 			continue
 		}
 
@@ -376,20 +382,18 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 	// ─── STEP 3: DETERMINE resolutions ───────────────────────────
 	targetResolutions := transcoder.DetermineResolutions(shortSide)
 
-	// Filter out resolutions that already have media records
+	// Filter out resolutions that already have media or pending S3 ingest
 	var pendingResolutions []string
 	for _, res := range targetResolutions {
-		resPtr := res
-		existingCount, _ := models.MediaModel.CountDocuments(ctx, bson.M{
-			"fileId":     fileID,
-			"type":       models.MediaTypeVideo,
-			"resolution": resPtr,
-		})
-		if existingCount == 0 {
-			pendingResolutions = append(pendingResolutions, res)
-		} else {
-			log.Printf("⏭️  [%s] Skip %sp — already exists", slug, res)
+		if resolutionCovered(ctx, fileID, res) {
+			if hasVideoMedia(ctx, fileID, res) {
+				log.Printf("⏭️  [%s] Skip %sp — media already exists", slug, res)
+			} else {
+				log.Printf("⏭️  [%s] Skip %sp — ingest pending (await server-transfer)", slug, res)
+			}
+			continue
 		}
+		pendingResolutions = append(pendingResolutions, res)
 	}
 
 	if len(pendingResolutions) == 0 {

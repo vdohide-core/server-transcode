@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,103 @@ func categorizeError(errMsg string) string {
 	default:
 		return "unknown"
 	}
+}
+
+var transcodeResolutions = []string{
+	models.Resolution360,
+	models.Resolution480,
+	models.Resolution720,
+	models.Resolution1080,
+}
+
+func hasVideoMedia(ctx context.Context, fileID, resolution string) bool {
+	count, _ := models.MediaModel.CountDocuments(ctx, bson.M{
+		"fileId":     fileID,
+		"type":       models.MediaTypeVideo,
+		"resolution": resolution,
+		"$or": []bson.M{
+			{"deletedAt": bson.M{"$exists": false}},
+			{"deletedAt": nil},
+		},
+	})
+	return count > 0
+}
+
+func hasPendingTranscodeIngest(ctx context.Context, fileID, fileName string) bool {
+	count, _ := models.IngestModel.CountDocuments(ctx, bson.M{
+		"fileId":     fileID,
+		"fileName":   fileName,
+		"sourceType": models.IngestSourceTypeProcessed,
+		"$or": []bson.M{
+			{"deletedAt": bson.M{"$exists": false}},
+			{"deletedAt": nil},
+		},
+	})
+	return count > 0
+}
+
+func highestResolutionFromMedias(ctx context.Context, fileID string) int {
+	highest := 0
+	for _, res := range []string{
+		models.Resolution1080,
+		models.Resolution720,
+		models.Resolution480,
+		models.Resolution360,
+	} {
+		if !hasVideoMedia(ctx, fileID, res) {
+			continue
+		}
+		if n, err := strconv.Atoi(res); err == nil && n > highest {
+			highest = n
+		}
+	}
+	return highest
+}
+
+// resolutionsRequiredForFile returns tiers that should exist for this file (360p … up to highest tier).
+// Uses metadata.highest when set (same as transfer/download), else infers from existing medias.
+func resolutionsRequiredForFile(ctx context.Context, fileID string) []string {
+	tier := 0
+	file, err := models.FileModel.FindByID(ctx, fileID)
+	if err == nil && file.Metadata != nil && file.Metadata.Highest != nil && *file.Metadata.Highest > 0 {
+		tier = *file.Metadata.Highest
+	} else if fromMedias := highestResolutionFromMedias(ctx, fileID); fromMedias > 0 {
+		tier = fromMedias
+	}
+
+	if tier > 0 {
+		var required []string
+		for _, res := range transcodeResolutions {
+			if n, err := strconv.Atoi(res); err == nil && n <= tier {
+				required = append(required, res)
+			}
+		}
+		if len(required) > 0 {
+			return required
+		}
+	}
+
+	// Unknown tier — conservative: require all standard resolutions (legacy behavior).
+	return transcodeResolutions
+}
+
+// resolutionCovered is true when media exists or S3 ingest is pending (await server-transfer).
+func resolutionCovered(ctx context.Context, fileID, res string) bool {
+	if hasVideoMedia(ctx, fileID, res) {
+		return true
+	}
+	return hasPendingTranscodeIngest(ctx, fileID, models.ResolutionToFileName[res])
+}
+
+// needsTranscode returns true if at least one required resolution still needs encoding.
+// Required tiers follow metadata.highest / existing medias — not blindly 1080p for every file.
+func needsTranscode(ctx context.Context, fileID string) bool {
+	for _, res := range resolutionsRequiredForFile(ctx, fileID) {
+		if !resolutionCovered(ctx, fileID, res) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─── isCancelled ─────────────────────────────────────────────
