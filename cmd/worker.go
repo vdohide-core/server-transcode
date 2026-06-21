@@ -12,6 +12,7 @@ import (
 
 	"server-transcode/internal/config"
 	"server-transcode/internal/db/models"
+	"server-transcode/internal/downloader"
 	"server-transcode/internal/transcoder"
 	"server-transcode/internal/uploader"
 	"server-transcode/internal/utils"
@@ -210,6 +211,64 @@ func findAlternativeStorage(ctx context.Context, excludeID string) (*models.Stor
 	return storage, nil
 }
 
+func resolveS3TempStorage(ctx context.Context) (*models.Storage, error) {
+	return models.StorageModel.FindOne(ctx, bson.M{
+		"enable":  true,
+		"status":  models.StorageStatusOnline,
+		"type":    models.StorageTypeS3,
+		"accepts": bson.M{"$all": []string{"temp", "video"}},
+	}, options.FindOne().SetSort(bson.M{"capacity.percentage": 1}))
+}
+
+func isColocatedStorage(storageID string) bool {
+	return config.AppConfig.StorageId != "" &&
+		config.AppConfig.StoragePath != "" &&
+		storageID == config.AppConfig.StorageId
+}
+
+// resolveVideoInput returns a local path to the original video.
+// Uses co-located storage file when available, otherwise HTTP download from storage static server.
+func resolveVideoInput(
+	ctx context.Context,
+	process *models.VideoProcess,
+	slug, fileID, downloadDir string,
+	videoMedia *models.Media,
+	sourceStorage *models.Storage,
+) (string, error) {
+	videoFileName := derefStr(videoMedia.FileName)
+	sourceStorageID := derefStr(videoMedia.StorageID)
+	originalPath := filepath.Join(downloadDir, models.FileNameOriginal)
+
+	if isColocatedStorage(sourceStorageID) {
+		localPath := filepath.Join(config.AppConfig.StoragePath, fileID, videoFileName)
+		if _, statErr := os.Stat(localPath); statErr == nil {
+			log.Printf("📂 [%s] Using local storage file: %s", slug, localPath)
+			return localPath, nil
+		}
+		log.Printf("⚠️  [%s] Local file missing, falling back to HTTP download", slug)
+	}
+
+	hostPort := sourceStorage.GetHostPort()
+	if hostPort == "" {
+		return "", fmt.Errorf("storage has no host")
+	}
+
+	url := fmt.Sprintf("http://%s/%s.mp4", hostPort, videoMedia.Slug)
+	log.Printf("📥 [%s] Downloading %s", slug, url)
+
+	err := downloader.DownloadURL(ctx, url, originalPath, func(done, total int64) {
+		if total > 0 {
+			percent := float64(done) / float64(total) * 100
+			updateTimelineStep(ctx, process.ID, "download", models.StepStatusProcessing, percent)
+			updateOverallPercent(ctx, process.ID, percent*0.1)
+		}
+	})
+	if err != nil {
+		return "", err
+	}
+	return originalPath, nil
+}
+
 // ─── Main Transcode Process ──────────────────────────────────
 
 func runTranscode(ctx context.Context, process *models.VideoProcess) error {
@@ -255,12 +314,11 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		return fmt.Errorf("source storage not found: %w", err)
 	}
 
-	// ─── STEP 1: DOWNLOAD original from storage ──────────────────
+	// ─── STEP 1: RESOLVE original video input ──────────────────
 	originalPath := filepath.Join(downloadDir, models.FileNameOriginal)
+	needResolve := true
 
-	// Skip download if file already exists AND size matches media record
 	if info, statErr := os.Stat(originalPath); statErr == nil && info.Size() > 0 {
-		// Validate file size against media record to detect incomplete downloads
 		expectedSize := int64(0)
 		if originalMedia.Metadata != nil {
 			switch v := originalMedia.Metadata.Size.(type) {
@@ -276,101 +334,26 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		}
 
 		if expectedSize > 0 && info.Size() != expectedSize {
-			log.Printf("⚠️  [%s] Original file size mismatch (local=%.2f MB, expected=%.2f MB) — re-downloading",
-				slug, float64(info.Size())/1024/1024, float64(expectedSize)/1024/1024)
+			log.Printf("⚠️  [%s] Cached file size mismatch — re-downloading", slug)
 			os.Remove(originalPath)
 		} else {
 			log.Printf("📥 [%s] Original already cached (%.2f MB) — skipping download", slug, float64(info.Size())/1024/1024)
 			completeStep(ctx, process.ID, "download")
 			updateOverallPercent(ctx, process.ID, 10)
+			needResolve = false
 		}
 	}
 
-	if _, statErr := os.Stat(originalPath); statErr != nil {
+	if needResolve {
 		startStep(ctx, process.ID, "download")
-
-		localStoragePath := config.AppConfig.StoragePath
-		localStorageID := config.AppConfig.StorageId
-
-		if localStoragePath != "" && localStorageID != "" && sourceStorageID == localStorageID {
-			// Local copy — file is on this machine
-			originalFileName := derefStr(originalMedia.FileName)
-			srcPath := filepath.Join(localStoragePath, fileID, originalFileName)
-			log.Printf("📥 [%s] Copying original from local: %s", slug, srcPath)
-
-			srcFile, err := os.Open(srcPath)
-			if err != nil {
-				failProcess(ctx, process.ID, slug, fmt.Sprintf("local file not found: %v", err))
-				return err
-			}
-			dstFile, err := os.Create(originalPath)
-			if err != nil {
-				srcFile.Close()
-				failProcess(ctx, process.ID, slug, fmt.Sprintf("create temp file: %v", err))
-				return err
-			}
-
-			srcInfo, _ := srcFile.Stat()
-			totalSize := srcInfo.Size()
-			buf := make([]byte, 1024*1024)
-			var copied int64
-			var lastReported int64
-
-			for {
-				n, readErr := srcFile.Read(buf)
-				if n > 0 {
-					dstFile.Write(buf[:n])
-					copied += int64(n)
-					if copied-lastReported >= 5*1024*1024 || copied == totalSize {
-						lastReported = copied
-						percent := float64(copied) / float64(totalSize) * 100
-						updateTimelineStep(ctx, process.ID, "download", models.StepStatusProcessing, percent)
-						updateOverallPercent(ctx, process.ID, percent*0.1) // download = 10% of overall
-					}
-				}
-				if readErr != nil {
-					break
-				}
-			}
-			srcFile.Close()
-			dstFile.Close()
-		} else if sourceStorage.HasSSHCredentials() {
-			// Download via SCP (Node.js script)
-			log.Printf("📥 [%s] Downloading original via SCP from %s", slug, sourceStorage.Name)
-
-			originalFileName := derefStr(originalMedia.FileName)
-			remotePath := sourceStorage.GetPath() + "/" + fileID + "/" + originalFileName
-			scpConfig := uploader.SCPDownloadConfig{
-				Host:       sourceStorage.GetHost(),
-				Port:       sourceStorage.Local.SSH.Port,
-				Username:   sourceStorage.Local.SSH.Username,
-				Password:   sourceStorage.Local.SSH.Password,
-				RemotePath: remotePath,
-				LocalPath:  originalPath,
-			}
-			if scpConfig.Port == 0 {
-				scpConfig.Port = 22
-			}
-
-			err = uploader.DownloadViaSCP(scpConfig, func(p uploader.SCPProgress) {
-				if p.Type == "progress" && p.Total > 0 {
-					percent := float64(p.Transferred) / float64(p.Total) * 100
-					updateTimelineStep(ctx, process.ID, "download", models.StepStatusProcessing, percent)
-					updateOverallPercent(ctx, process.ID, percent*0.1)
-				}
-			})
-			if err != nil {
-				failProcess(ctx, process.ID, slug, fmt.Sprintf("SCP download failed: %v", err))
-				return err
-			}
-		} else {
-			failProcess(ctx, process.ID, slug, "no download method available for source storage")
-			return fmt.Errorf("no download method")
+		originalPath, err = resolveVideoInput(ctx, process, slug, fileID, downloadDir, originalMedia, sourceStorage)
+		if err != nil {
+			failProcess(ctx, process.ID, slug, fmt.Sprintf("download failed: %v", err))
+			return err
 		}
-
 		completeStep(ctx, process.ID, "download")
 		updateOverallPercent(ctx, process.ID, 10)
-		log.Printf("✅ [%s] Download complete", slug)
+		log.Printf("✅ [%s] Input ready: %s", slug, originalPath)
 	}
 
 	if isCancelled(ctx, process.ID) {
@@ -425,7 +408,7 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 
 	log.Printf("🎯 [%s] Target resolutions: %v", slug, pendingResolutions)
 
-	// Initialize timeline for each resolution (encode + upload) + thumbnail
+	// Initialize timeline for each resolution (encode + upload)
 	timelineInit := bson.M{}
 	for _, res := range pendingResolutions {
 		encodeKey := fmt.Sprintf("timeline.encode_%s", res)
@@ -433,7 +416,6 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		timelineInit[encodeKey+".status"] = models.StepStatusPending
 		timelineInit[uploadKey+".status"] = models.StepStatusPending
 	}
-	timelineInit["timeline.thumbnail.status"] = models.StepStatusPending
 	timelineInit["updatedAt"] = time.Now()
 	models.VideoProcessModel.UpdateByID(ctx, process.ID, bson.M{"$set": timelineInit})
 
@@ -449,17 +431,27 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		log.Printf("🎮 [%s] GPU mode — skipping processing lock", slug)
 	}
 
-	// Resolve upload storage
-	uploadStorage, err := resolveStorage(ctx, sourceStorageID)
-	if err != nil {
-		failProcess(ctx, process.ID, slug, fmt.Sprintf("no upload storage: %v", err))
-		return err
+	// Resolve fallback upload storage (optional when S3 temp or local storage is available)
+	var fallbackStorage *models.Storage
+	if config.AppConfig.StorageId != "" && config.AppConfig.StoragePath != "" {
+		log.Printf("📦 [%s] Local storage configured for upload", slug)
+	} else if s3Storage, s3Err := resolveS3TempStorage(ctx); s3Err == nil {
+		log.Printf("📦 [%s] S3 temp storage available: %s", slug, s3Storage.Name)
+		fallbackStorage, _ = resolveStorage(ctx, sourceStorageID)
+	} else {
+		var resolveErr error
+		fallbackStorage, resolveErr = resolveStorage(ctx, sourceStorageID)
+		if resolveErr != nil {
+			failProcess(ctx, process.ID, slug, fmt.Sprintf("no upload storage: %v", resolveErr))
+			return resolveErr
+		}
+		log.Printf("📦 [%s] Fallback upload storage: %s", slug, fallbackStorage.Name)
 	}
 
 	// ─── STEP 4: ENCODE + UPLOAD + CREATE MEDIA (sequential) ────
-	// Progress allocation: download=10%, encode=70%, thumbnail=10%, final=10%
+	// Progress allocation: download=10%, encode=80%, final=10%
 	encodeProgressBase := 10.0
-	encodeProgressTotal := 70.0
+	encodeProgressTotal := 80.0
 	perResProgress := encodeProgressTotal / float64(len(pendingResolutions))
 
 	var highestResolution int
@@ -521,21 +513,23 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		uploadStepName := fmt.Sprintf("upload_%s", res)
 		startStep(ctx, process.ID, uploadStepName)
 		log.Printf("📤 [%s] Uploading %s...", slug, fileName)
-		onUploadProgress := func(p uploader.SCPProgress) {
-			if p.Type == "progress" && p.Total > 0 {
-				percent := float64(p.Transferred) / float64(p.Total) * 100
+		onUploadProgress := func(transferred, total int64) {
+			if total > 0 {
+				percent := float64(transferred) / float64(total) * 100
 				updateTimelineStep(ctx, process.ID, uploadStepName, models.StepStatusProcessing, percent)
 			}
 		}
-		if err := uploadFile(ctx, process, uploadStorage, outputPath, fileName, onUploadProgress); err != nil {
+		usedStorage, err := uploadFile(ctx, process, fallbackStorage, outputPath, fileName, onUploadProgress)
+		if err != nil {
 			// If permission/auth error, try alternative storage before failing
-			if isPermissionError(err) && uploadStorage.ID != "" {
-				log.Printf("⚠️  [%s] Permission denied on %s — trying alternative storage...", slug, uploadStorage.Name)
-				altStorage, altErr := findAlternativeStorage(ctx, uploadStorage.ID)
+			if isPermissionError(err) && fallbackStorage != nil && fallbackStorage.ID != "" {
+				log.Printf("⚠️  [%s] Permission denied on %s — trying alternative storage...", slug, fallbackStorage.Name)
+				altStorage, altErr := findAlternativeStorage(ctx, fallbackStorage.ID)
 				if altErr == nil {
 					log.Printf("📦 [%s] Retrying upload on %s", slug, altStorage.Name)
-					if retryErr := uploadFile(ctx, process, altStorage, outputPath, fileName, onUploadProgress); retryErr == nil {
-						uploadStorage = altStorage // use alt storage for remaining uploads
+					if retryStorage, retryErr := uploadFile(ctx, process, altStorage, outputPath, fileName, onUploadProgress); retryErr == nil {
+						usedStorage = retryStorage
+						fallbackStorage = altStorage
 						goto uploadSuccess
 					} else {
 						log.Printf("⚠️  [%s] Alternative storage also failed: %v", slug, retryErr)
@@ -548,38 +542,44 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 	uploadSuccess:
 		completeStep(ctx, process.ID, uploadStepName)
 
-		// Create media record
 		fileSize := transcoder.GetFileSize(outputPath)
 		resInt, _ := strconv.Atoi(res)
 
-		now := time.Now()
-		resPtr := res
-		fnPtr := fileName
-		storageIDPtr := uploadStorage.ID
-		mediaSlug := utils.RandomString(11, false)
+		if usedStorage.Type == models.StorageTypeS3 {
+			if err := createTranscodeIngest(ctx, fileID, usedStorage, fileName, fileSize); err != nil {
+				failProcess(ctx, process.ID, slug, fmt.Sprintf("create ingest %s: %v", fileName, err))
+				return err
+			}
+			log.Printf("✅ [%s] S3 upload + ingest %s (server-transfer will install)", slug, fileName)
+		} else {
+			now := time.Now()
+			resPtr := res
+			fnPtr := fileName
+			storageIDPtr := usedStorage.ID
+			mediaSlug := utils.RandomString(11, false)
 
-		media := models.Media{
-			ID:         newUUID(),
-			Type:       models.MediaTypeVideo,
-			FileName:   &fnPtr,
-			Resolution: &resPtr,
-			StorageID:  &storageIDPtr,
-			Slug:       mediaSlug,
-			FileID:     &fileID,
-			Metadata: &models.MediaMetadata{
-				Size:     fileSize,
-				Width:    int(targetW),
-				Height:   int(targetH),
-				Duration: float64(videoInfo.Duration),
-			},
-			CreatedAt: now,
-			UpdatedAt: now,
+			media := models.Media{
+				ID:         newUUID(),
+				Type:       models.MediaTypeVideo,
+				FileName:   &fnPtr,
+				Resolution: &resPtr,
+				StorageID:  &storageIDPtr,
+				Slug:       mediaSlug,
+				FileID:     &fileID,
+				Metadata: &models.MediaMetadata{
+					Size:     fileSize,
+					Width:    int(targetW),
+					Height:   int(targetH),
+					Duration: float64(videoInfo.Duration),
+				},
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			models.MediaModel.Create(ctx, &media)
+			log.Printf("✅ [%s] Created media record for %sp", slug, res)
+
+			cloneMediaToClonedFiles(ctx, fileID, media, slug)
 		}
-		models.MediaModel.Create(ctx, &media)
-		log.Printf("✅ [%s] Created media record for %sp", slug, res)
-
-		// Clone media to files that were cloned from this original
-		cloneMediaToClonedFiles(ctx, fileID, media, slug)
 
 		addCompleted(ctx, process.ID, res)
 
@@ -588,84 +588,16 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 			highestResolution = resInt
 		}
 
-		// Delete temp file — keep 360p for thumbnail, delete others immediately
-		if res != models.Resolution360 {
-			os.Remove(outputPath)
-			log.Printf("🗑️  [%s] Removed temp %s", slug, fileName)
-		}
+		// Delete temp encode output
+		os.Remove(outputPath)
+		log.Printf("🗑️  [%s] Removed temp %s", slug, fileName)
 	}
 
-	// ─── STEP 5: THUMBNAIL — sprite sheet + sprite.vtt ───────────
 	if isCancelled(ctx, process.ID) {
 		return nil
 	}
 
-	startStep(ctx, process.ID, "thumbnail")
-	updateOverallPercent(ctx, process.ID, 80)
-
-	// Try file_360.mp4 first (smallest = fastest), fallback to original
-	thumbInput := filepath.Join(downloadDir, models.ResolutionToFileName[models.Resolution360])
-	if _, err := os.Stat(thumbInput); os.IsNotExist(err) {
-		thumbInput = originalPath
-		log.Printf("📌 [%s] file_360.mp4 not found, using original for thumbnails", slug)
-	}
-
-	log.Printf("🖼️  [%s] Generating sprite thumbnails from %s...", slug, filepath.Base(thumbInput))
-	spriteResult, err := transcoder.GenerateSpriteThumbnails(thumbInput, downloadDir, videoInfo.DurationF)
-	if err != nil {
-		log.Printf("⚠️  [%s] Sprite generation failed: %v — skipping thumbnails", slug, err)
-	} else {
-		// Clean up any temp files before uploading
-		os.Remove(filepath.Join(spriteResult.SpriteDir, "cropped_last.jpg"))
-
-		// Upload entire sprite/ folder
-		log.Printf("📤 [%s] Uploading sprite folder...", slug)
-		if err := uploadDir(ctx, process, uploadStorage, spriteResult.SpriteDir, "sprite"); err != nil {
-			log.Printf("⚠️  [%s] Failed to upload sprite folder: %v", slug, err)
-		}
-
-		// Calculate total sprite size
-		var totalSpriteSize int64
-		for _, spriteFileName := range spriteResult.SpriteFiles {
-			totalSpriteSize += transcoder.GetFileSize(filepath.Join(spriteResult.SpriteDir, spriteFileName))
-		}
-
-		// Create thumbnail media record
-		now := time.Now()
-		thumbFn := "sprite.vtt"
-		storageIDPtr := uploadStorage.ID
-
-		thumbMedia := models.Media{
-			ID:        newUUID(),
-			Type:      models.MediaTypeThumbnail,
-			FileName:  &thumbFn,
-			StorageID: &storageIDPtr,
-			Slug:      utils.RandomString(11, false),
-			FileID:    &fileID,
-			Metadata: &models.MediaMetadata{
-				Size: totalSpriteSize,
-			},
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		models.MediaModel.Create(ctx, &thumbMedia)
-		log.Printf("✅ [%s] Created thumbnail media record", slug)
-
-		// Clone thumbnail media to cloned files
-		cloneMediaToClonedFiles(ctx, fileID, thumbMedia, slug)
-	}
-
-	completeStep(ctx, process.ID, "thumbnail")
-	updateOverallPercent(ctx, process.ID, 90)
-
-	// Delete 360p temp file (kept for thumbnail)
-	file360Path := filepath.Join(downloadDir, models.ResolutionToFileName[models.Resolution360])
-	if _, err := os.Stat(file360Path); err == nil {
-		os.Remove(file360Path)
-		log.Printf("🗑️  [%s] Removed temp file_360.mp4 (after thumbnails)", slug)
-	}
-
-	// ─── STEP 6: UPDATE FILE metadata.highest ────────────────────
+	// ─── STEP 5: UPDATE FILE metadata.highest ────────────────────
 	if highestResolution > 0 {
 		models.FileModel.UpdateByID(ctx, fileID, bson.M{"$set": bson.M{
 			"metadata.highest": highestResolution,
@@ -677,10 +609,10 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 		updateClonedFilesHighest(ctx, fileID, highestResolution, slug)
 	}
 
-	// ─── STEP 7: CLEANUP ─────────────────────────────────────────
+	// ─── STEP 6: CLEANUP ─────────────────────────────────────────
 	updateOverallPercent(ctx, process.ID, 100)
 
-	// ─── STEP 8: CLOUDFLARE CACHE PURGE ──────────────────────────
+	// ─── STEP 7: CLOUDFLARE CACHE PURGE ──────────────────────────
 	purgePlaylistCache(ctx, slug, fileID)
 
 	// Mark success so deferred cleanup runs
@@ -699,26 +631,37 @@ func runTranscode(ctx context.Context, process *models.VideoProcess) error {
 
 // ─── Upload Helpers ──────────────────────────────────────────
 
-func uploadFile(_ context.Context, process *models.VideoProcess, storage *models.Storage, localPath, fileName string, onProgress uploader.OnSCPProgress) error {
+func uploadFile(ctx context.Context, process *models.VideoProcess, fallbackStorage *models.Storage, localPath, fileName string, onProgress func(transferred, total int64)) (*models.Storage, error) {
 	fileID := derefStr(process.FileID)
 	localStoragePath := config.AppConfig.StoragePath
 	localStorageID := config.AppConfig.StorageId
 
 	if localStoragePath != "" && localStorageID != "" {
-		// Local storage — move file
 		_, err := uploader.MoveFileLocal(localStoragePath, fileID, localPath, fileName, nil)
-		return err
+		return &models.Storage{ID: localStorageID}, err
 	}
 
-	if storage.HasSSHCredentials() {
-		// SCP via Node.js script
-		remotePath := storage.GetPath()
+	if s3Storage, err := resolveS3TempStorage(ctx); err == nil {
+		objectKey := fmt.Sprintf("%s/%s", fileID, fileName)
+		if err := uploader.UploadToS3(s3Storage, localPath, objectKey, "video/mp4", onProgress); err == nil {
+			log.Printf("✅ S3 upload complete: %s", objectKey)
+			return s3Storage, nil
+		}
+		log.Printf("⚠️  S3 upload failed: %v — trying fallback", err)
+	}
+
+	if fallbackStorage == nil {
+		return nil, fmt.Errorf("no upload storage available (S3 failed, no SSH fallback)")
+	}
+
+	if fallbackStorage.HasSSHCredentials() {
+		remotePath := fallbackStorage.GetPath()
 		scpConfig := uploader.SCPConfig{
 			LocalPath:  localPath,
-			Host:       storage.GetHost(),
-			Port:       storage.Local.SSH.Port,
-			Username:   storage.Local.SSH.Username,
-			Password:   storage.Local.SSH.Password,
+			Host:       fallbackStorage.GetHost(),
+			Port:       fallbackStorage.Local.SSH.Port,
+			Username:   fallbackStorage.Local.SSH.Username,
+			Password:   fallbackStorage.Local.SSH.Password,
 			RemotePath: fmt.Sprintf("%s/%s", remotePath, fileID),
 			FileName:   fileName,
 		}
@@ -726,55 +669,50 @@ func uploadFile(_ context.Context, process *models.VideoProcess, storage *models
 			scpConfig.Port = 22
 		}
 
-		return uploader.UploadViaSCP(scpConfig, onProgress)
+		err := uploader.UploadViaSCP(scpConfig, func(p uploader.SCPProgress) {
+			if onProgress != nil && p.Type == "progress" && p.Total > 0 {
+				onProgress(p.Transferred, p.Total)
+			}
+		})
+		return fallbackStorage, err
 	}
 
-	return fmt.Errorf("no upload method available for storage %s", storage.ID)
+	return nil, fmt.Errorf("no upload method available for storage %s", fallbackStorage.ID)
 }
 
-func uploadDir(_ context.Context, process *models.VideoProcess, storage *models.Storage, localDir, remoteDirName string) error {
-	fileID := derefStr(process.FileID)
-	localStoragePath := config.AppConfig.StoragePath
-	localStorageID := config.AppConfig.StorageId
-
-	if localStoragePath != "" && localStorageID != "" {
-		// Local storage — copy directory
-		destDir := filepath.Join(localStoragePath, fileID, remoteDirName)
-		os.MkdirAll(destDir, 0755)
-
-		entries, err := os.ReadDir(localDir)
-		if err != nil {
-			return fmt.Errorf("read dir: %w", err)
-		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			_, err := uploader.MoveFileLocal(localStoragePath, fileID, filepath.Join(localDir, entry.Name()), remoteDirName+"/"+entry.Name(), nil)
-			if err != nil {
-				return fmt.Errorf("copy %s: %w", entry.Name(), err)
-			}
-		}
+func createTranscodeIngest(ctx context.Context, fileID string, s3Storage *models.Storage, fileName string, size int64) error {
+	count, _ := models.IngestModel.CountDocuments(ctx, bson.M{
+		"fileId": fileID, "fileName": fileName,
+		"sourceType": models.IngestSourceTypeProcessed,
+		"deletedAt":  bson.M{"$exists": false},
+	})
+	if count > 0 {
 		return nil
 	}
 
-	if storage.HasSSHCredentials() {
-		remotePath := storage.GetPath()
-		scpConfig := uploader.SCPDirConfig{
-			LocalDir:   localDir,
-			Host:       storage.GetHost(),
-			Port:       storage.Local.SSH.Port,
-			Username:   storage.Local.SSH.Username,
-			Password:   storage.Local.SSH.Password,
-			RemotePath: fmt.Sprintf("%s/%s/%s", remotePath, fileID, remoteDirName),
-		}
-		if scpConfig.Port == 0 {
-			scpConfig.Port = 22
-		}
-		return uploader.UploadDirViaSCP(scpConfig)
+	now := time.Now()
+	ingestPath := fmt.Sprintf("%s/%s", fileID, fileName)
+	mimeType := "video/mp4"
+	storageID := s3Storage.ID
+	ingest := models.Ingest{
+		ID:         newUUID(),
+		FileID:     &fileID,
+		StorageID:  &storageID,
+		FileName:   fileName,
+		Status:     "completed",
+		Size:       size,
+		MimeType:   &mimeType,
+		Path:       &ingestPath,
+		SourceType: models.IngestSourceTypeProcessed,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
-
-	return fmt.Errorf("no upload method available for storage %s", storage.ID)
+	_, err := models.IngestModel.Create(ctx, &ingest)
+	if err != nil {
+		return err
+	}
+	log.Printf("✅ Created ingest: fileId=%s fileName=%s path=%s storageId=%s", fileID, fileName, ingestPath, storageID)
+	return nil
 }
 
 // ─── Find Original Media ─────────────────────────────────────

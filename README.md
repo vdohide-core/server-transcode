@@ -1,15 +1,15 @@
 # Server Transcode
 
-Worker service สำหรับ transcode วิดีโอ (encode multi-resolution + upload + thumbnail) สำหรับ [VDOHide](https://vdohide.com)
+Worker service สำหรับ transcode วิดีโอ (encode multi-resolution + upload) สำหรับ [VDOHide](https://vdohide.com)
 
 ## Features
 
 - **Multi-Resolution Encoding** — encode 360p, 480p, 720p, 1080p จาก original media
 - **GPU Acceleration** — รองรับ NVIDIA h264_nvenc (auto-detect, fallback เป็น CPU)
-- **SCP Upload** — อัพโหลดไฟล์ไปยัง storage server ผ่าน SCP
+- **S3 Upload** — อัพโหลด transcoded files ขึ้น S3 temp storage (fallback เป็น SCP/local)
+- **HTTP Download** — โหลด original จาก storage static server (`http://host:port/{slug}.mp4`)
+- **SCP Upload** — fallback อัพโหลดไปยัง storage server ผ่าน SCP
 - **Storage Fallback** — Permission denied → ลอง storage อื่นอัตโนมัติ
-- **Sprite Thumbnail** — สร้าง sprite sheet + VTT สำหรับ video preview
-- **HLS Generation** — สร้าง HLS playlist (.m3u8 + .ts) สำหรับ adaptive streaming
 - **Multi-Worker** — รัน worker หลายตัวพร้อมกัน ด้วย `WORKER_ID`
 - **Auto Retry** — retry อัตโนมัติ 3 ครั้ง พร้อม backoff (30s, 30s, 60s)
 - **File Error Lock** — ไฟล์ที่ fail ถาวรจะถูกล็อคใน `file_errors` ไม่หยิบมาทำซ้ำ
@@ -105,7 +105,7 @@ MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/platform
 STORAGE_ID=your-storage-uuid
 STORAGE_PATH=/home/files
 
-# Optional — Worker ID (default: hostname@1)
+# Optional — Worker ID (default: transcode_hostname@1)
 WORKER_ID=worker-1
 ```
 
@@ -163,8 +163,7 @@ Worker Loop (5s poll)
 │       │   ├── Encode (GPU/CPU)   — h264_nvenc or libx264
 │       │   ├── Upload (SCP)       — fallback to alt storage on Permission denied
 │       │   └── Create media       — media record + clone to cloned files
-│       ├── Thumbnail              — sprite sheet + sprite.vtt
-│       └── HLS (optional)         — m3u8 + ts segments
+│       └── Update metadata.highest
 └── findAndClaimFile() fail → sleep 30s → retry
 ```
 
@@ -178,8 +177,7 @@ Worker Loop (5s poll)
   "encode_480":  { "status": "completed" },
   "upload_480":  { "status": "processing", "percent": 45 },
   "encode_720":  { "status": "pending" },
-  "upload_720":  { "status": "pending" },
-  "thumbnail":   { "status": "pending" }
+  "upload_720":  { "status": "pending" }
 }
 ```
 

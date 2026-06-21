@@ -42,7 +42,7 @@ func MoveFileLocal(
 	}
 
 	dest := filepath.Join(destDir, fileName)
-	// Ensure subdirectories exist (e.g. sprite/1.jpg)
+	// Ensure subdirectories exist (e.g. sprite/sprite-1.jpg)
 	os.MkdirAll(filepath.Dir(dest), 0755)
 	size, err := copyFile(filePath, dest)
 	if err != nil {
@@ -86,7 +86,7 @@ func MoveMultipleFilesLocal(
 	var completedBytes int64
 	for fileName, localPath := range files {
 		dest := filepath.Join(destDir, fileName)
-		// Ensure subdirectories exist (e.g. sprite/1.jpg)
+		// Ensure subdirectories exist (e.g. sprite/sprite-1.jpg)
 		os.MkdirAll(filepath.Dir(dest), 0755)
 		size, err := copyFile(localPath, dest)
 		if err != nil {

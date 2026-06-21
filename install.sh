@@ -196,7 +196,7 @@ ExecStart=$APP_DIR/$APP_NAME
 Restart=always
 RestartSec=5
 EnvironmentFile=$APP_DIR/.env
-Environment="WORKER_ID=$(hostname)@%i"
+Environment="WORKER_ID=transcode_$(hostname)@%i"
 Environment="PATH=$NODE_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [Install]

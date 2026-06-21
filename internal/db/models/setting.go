@@ -15,7 +15,7 @@ const (
 	SettingTranscodeEnabled = "transcode_enabled"
 	SettingGpuEnabled       = "transcode_gpu_enabled"
 	SettingTranscodeSort    = "transcode_sort"
-	SettingDomainContent    = "domain_content"
+	SettingDomainPlaylist   = "domain_playlist"
 	SettingCfZoneID         = "cf_zone_id"
 	SettingCfApiToken       = "cf_api_token"
 )

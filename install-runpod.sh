@@ -371,7 +371,7 @@ stop_workers
 print_status "Starting $WORKER_COUNT worker(s)..."
 
 for i in $(seq 1 $WORKER_COUNT); do
-    WORKER_ID="$(hostname)-transcode-$i"
+    WORKER_ID="transcode_$(hostname)@$i"
     WORKER_LOG="$LOG_DIR/worker-$i.log"
 
     # Export env vars and start
@@ -440,7 +440,7 @@ sleep 1
 echo "[$(date)] Starting $WORKER_COUNT worker(s)..."
 
 for i in $(seq 1 $WORKER_COUNT); do
-    WORKER_ID="$(hostname)-transcode-$i"
+    WORKER_ID="transcode_$(hostname)@$i"
     WORKER_LOG="$LOG_DIR/worker-$i.log"
 
     (

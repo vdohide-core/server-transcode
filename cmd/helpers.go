@@ -30,8 +30,6 @@ func categorizeError(errMsg string) string {
 		return "network"
 	case strings.Contains(e, "probe"):
 		return "probe"
-	case strings.Contains(e, "thumbnail") || strings.Contains(e, "sprite"):
-		return "thumbnail"
 	default:
 		return "unknown"
 	}
@@ -241,9 +239,9 @@ func updateClonedFilesHighest(ctx context.Context, sourceFileID string, highest 
 
 func purgePlaylistCache(ctx context.Context, slug, fileID string) {
 	// Read settings
-	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": models.SettingDomainContent})
+	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": models.SettingDomainPlaylist})
 	if err != nil {
-		return // domain_content not configured — skip
+		return // domain_playlist not configured — skip
 	}
 	domain := domainSetting.GetString("")
 	if domain == "" {

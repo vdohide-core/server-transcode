@@ -61,10 +61,11 @@ const (
 // ─── Ingest Source Types ─────────────────────────────────────────────
 
 const (
-	IngestSourceTypeUpload   = "upload"
-	IngestSourceTypeRemote   = "remote"
-	IngestSourceTypeGDrive   = "gdrive"
-	IngestSourceTypeS3Import = "s3_import"
+	IngestSourceTypeUpload    = "upload"
+	IngestSourceTypeRemote    = "remote"
+	IngestSourceTypeGDrive    = "gdrive"
+	IngestSourceTypeS3Import  = "s3_import"
+	IngestSourceTypeProcessed = "processed"
 )
 
 // ─── Storage Types ───────────────────────────────────────────────────

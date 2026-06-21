@@ -13,8 +13,10 @@ import (
 
 // ─── Worker ID ───────────────────────────────────────────────
 
+const WorkerTypeTranscode = "transcode"
+
 // GenerateWorkerID generates a unique worker ID.
-// Priority: WORKER_ID env → hostname@1
+// Priority: WORKER_ID env → transcode_hostname@1
 func GenerateWorkerID() string {
 	if envWorkerID := os.Getenv("WORKER_ID"); envWorkerID != "" {
 		return envWorkerID
@@ -23,7 +25,7 @@ func GenerateWorkerID() string {
 	if err != nil {
 		hostname = "unknown"
 	}
-	return fmt.Sprintf("%s@1", hostname)
+	return fmt.Sprintf("%s_%s@1", WorkerTypeTranscode, hostname)
 }
 
 // RandomString generates a random alphanumeric string.
